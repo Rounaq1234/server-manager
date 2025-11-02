@@ -1,0 +1,6 @@
+{
+  "welcome_channel": null,
+  "goodbye_channel": null,
+  "log_channel": null,
+  "welcome_dm_message": "👋 Welcome {user} to {server}! Glad to have you here!"
+}
