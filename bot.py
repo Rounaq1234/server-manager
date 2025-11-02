@@ -1,912 +1,742 @@
-# bot.py - Full-featured moderation + utilities bot
-# Features: moderation, setup, welcome/goodbye, warnings, timeouts, infractions,
-# auto-mod (links/spam/caps), XP & levels, tickets, reaction roles, premium flag,
-# interactive /help (buttons). Uses discord.py 2.x (app_commands + ui).
-import asyncio
-import random
-
-
+# bot.py - All-in-one moderation + XP + tickets + reaction-roles + premium + rotating status
+# Requires: discord.py 2.x, python-dotenv, aiohttp
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from discord.ui import View, Button
 from dotenv import load_dotenv
-import os, json, re, time, datetime, asyncio, traceback, aiofiles
+import os, json, re, time, datetime, random, asyncio, aiohttp, traceback
 
-# ----------------------------------------
-# Load environment
-# ----------------------------------------
+# ---------------------------
+# Load token
+# ---------------------------
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
-    raise RuntimeError("No TOKEN found in .env. Create .env with TOKEN=your_token_here")
+    raise RuntimeError("No TOKEN in .env. Add TOKEN=your_bot_token")
 
-# ----------------------------------------
-# Files and persistence helpers
-# ----------------------------------------
-DATA_FILES = {
-    "config": "config.json",
-    "warnings": "warnings.json",
-    "timeouts": "timeouts.json",
-    "xp": "xp.json",
-    "reaction": "reaction_panels.json",
-    "tickets": "tickets.json"
-}
-
-def ensure_file(filename, default):
-    if not os.path.exists(filename):
-        with open(filename, "w", encoding="utf-8") as f:
+# ---------------------------
+# File helpers & defaults
+# ---------------------------
+def ensure_json(fname, default):
+    if not os.path.exists(fname):
+        with open(fname, "w", encoding="utf-8") as f:
             json.dump(default, f, indent=4)
-
-# create defaults if missing
-ensure_file(DATA_FILES["config"], {
-    "welcome_channel": None,
-    "goodbye_channel": None,
-    "log_channel": None,
-    "filters": {"anti_link": True, "anti_spam": True, "caps_filter": True},
-    "level_rewards": {},  # "5": role_id
-    "premium_guilds": []   # list of guild ids (as strings) that have premium features enabled
-})
-for k in ("warnings","timeouts","xp","reaction","tickets"):
-    ensure_file(DATA_FILES[k], {})
-
-# async read/write helpers (use aiofiles for safe async writes)
-async def load_json(fname):
-    async with aiofiles.open(fname, "r", encoding="utf-8") as f:
-        text = await f.read()
-        return json.loads(text) if text.strip() else {}
-
-async def save_json(fname, data):
-    async with aiofiles.open(fname, "w", encoding="utf-8") as f:
-        await f.write(json.dumps(data, indent=4))
-
-# synchronous read helpers (used during startup)
-def load_json_sync(fname):
     with open(fname, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def save_json_sync(fname, data):
+def save_json(fname, data):
     with open(fname, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
-# ----------------------------------------
+# Files
+CONFIG_FILE = "config.json"
+WARN_FILE = "warnings.json"
+TIMEOUTS_FILE = "timeouts.json"
+XP_FILE = "xp.json"
+REACTION_FILE = "reaction_roles.json"
+TICKETS_DIR = "tickets"
+
+# Ensure files exist with safe default structures
+config = ensure_json(CONFIG_FILE, {"guilds": {}})
+warnings_data = ensure_json(WARN_FILE, {})
+timeouts_data = ensure_json(TIMEOUTS_FILE, {})
+xp_data = ensure_json(XP_FILE, {})
+reaction_panels = ensure_json(REACTION_FILE, {})
+
+if not os.path.isdir(TICKETS_DIR):
+    os.makedirs(TICKETS_DIR, exist_ok=True)
+
+# ---------------------------
 # Bot & intents
-# ----------------------------------------
+# ---------------------------
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ----------------------------------------
-# Utility: logging to configured channel
-# ----------------------------------------
-def get_config_sync():
-    return load_json_sync(DATA_FILES["config"])
+# ---------------------------
+# Utilities
+# ---------------------------
+def guild_config(guild_id: int):
+    gid = str(guild_id)
+    if gid not in config["guilds"]:
+        config["guilds"][gid] = {
+            "welcome_channel": None,
+            "goodbye_channel": None,
+            "log_channel": None,
+            "welcome_dm": "👋 Welcome {user} to {server}!",
+            "premium": False,
+            "level_rewards": {},  # level: role_id
+            "filters": {"anti_link": True, "anti_spam": True, "caps_filter": True},
+            "auto_role": None,
+            "ticket_category": None,
+            "staff_role": None
+        }
+        save_json(CONFIG_FILE, config)
+    return config["guilds"][gid]
 
-async def log_action(guild: discord.Guild, title: str, description: str = None, color=discord.Color.blurple()):
+def now_iso():
+    return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+def log_action(guild: discord.Guild, embed_or_text):
     try:
-        cfg = get_config_sync()
-        ch_id = cfg.get("log_channel")
-        if not ch_id:
+        gcfg = guild_config(guild.id)
+        lid = gcfg.get("log_channel")
+        if not lid:
             return
-        ch = guild.get_channel(int(ch_id))
+        ch = guild.get_channel(int(lid))
         if not ch:
             return
-        embed = discord.Embed(title=title, description=description or "", color=color, timestamp=discord.utils.utcnow())
-        await ch.send(embed=embed)
-    except Exception:
-        traceback.print_exc()
-
-# ----------------------------------------
-# On ready: sync commands
-# ----------------------------------------
-# --- Auto Rotating Status System ---
-async def cycle_status():
-    """Automatically change bot status every 60 seconds."""
-    statuses = [
-        ("Watching", "over the server 👀"),
-        ("Listening", "to your commands 🎧"),
-        ("Playing", "with moderation tools 🛠️"),
-        ("Competing", "for best bot award 🏆"),
-        ("Watching", "for rule breakers ⚔️"),
-        ("Listening", "to feedback 💬")
-    ]
-
-    while True:
-        status_type, status_text = random.choice(statuses)
-
-        if status_type.lower() == "playing":
-            activity = discord.Game(name=status_text)
-        elif status_type.lower() == "listening":
-            activity = discord.Activity(type=discord.ActivityType.listening, name=status_text)
-        elif status_type.lower() == "watching":
-            activity = discord.Activity(type=discord.ActivityType.watching, name=status_text)
-        elif status_type.lower() == "competing":
-            activity = discord.Activity(type=discord.ActivityType.competing, name=status_text)
+        if isinstance(embed_or_text, discord.Embed):
+            asyncio.create_task(ch.send(embed=embed_or_text))
         else:
-            activity = discord.Game(name=status_text)
+            asyncio.create_task(ch.send(embed=discord.Embed(description=str(embed_or_text), color=discord.Color.blurple())))
+    except Exception:
+        print("log_action error:", traceback.format_exc())
 
-        await bot.change_presence(status=discord.Status.online, activity=activity)
-        await asyncio.sleep(60)  # Change every 60 seconds
+# ---------------------------
+# XP & Leveling
+# ---------------------------
+def load_xp():
+    global xp_data
+    xp_data = ensure_json(XP_FILE, {})
 
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
-    bot.loop.create_task(cycle_status())
+def save_xp():
+    save_json(XP_FILE, xp_data)
 
-    try:
-        synced = await bot.tree.sync()
-        print(f"📚 Synced {len(synced)} slash commands.")
-    except Exception as e:
-        print("⚠️ Slash sync failed:", e)
+def xp_to_level(xp):
+    lvl = 0
+    while xp >= (50 * lvl * lvl + 50 * lvl):
+        lvl += 1
+    return lvl
 
-# ----------------------------------------
-# Welcome / Goodbye events
-# ----------------------------------------
-@bot.event
-async def on_member_join(member: discord.Member):
-    cfg = get_config_sync()
-    wc = cfg.get("welcome_channel")
-    if wc:
-        ch = member.guild.get_channel(int(wc))
-        if ch:
-            await ch.send(f"🎉 Welcome to the server, {member.mention}!")
-    # custom DM from config? use welcome_dm_message key if desired
-    dm_msg = cfg.get("welcome_dm_message") if "welcome_dm_message" in cfg else None
-    if dm_msg:
-        try:
-            msg = dm_msg.replace("{user}", member.name).replace("{server}", member.guild.name)
-            await member.send(msg)
-        except:
-            pass
-    else:
-        # default DM
-        try:
-            await member.send(f"👋 Hi {member.name}, welcome to **{member.guild.name}**!")
-        except:
-            pass
-    await log_action(member.guild, "Member Joined", f"{member} ({member.id})")
-
-@bot.event
-async def on_member_remove(member: discord.Member):
-    cfg = get_config_sync()
-    gc = cfg.get("goodbye_channel")
-    if gc:
-        ch = member.guild.get_channel(int(gc))
-        if ch:
-            await ch.send(f"👋 {member.name} has left the server.")
-    await log_action(member.guild, "Member Left", f"{member} ({member.id})")
-
-# ----------------------------------------
-# Auto-moderation: links, spam, caps
-# ----------------------------------------
-user_message_timestamps = {}  # for simple spam detection: user_id -> [timestamps]
-
-@bot.event
-async def on_message(message: discord.Message):
-    # ignore bots
-    if message.author.bot:
-        return
-
-    cfg = get_config_sync()
-    guild = message.guild
-    content = message.content or ""
-
-    # Anti-link
-    if cfg.get("filters", {}).get("anti_link", True):
-        if re.search(r"https?://", content, re.IGNORECASE):
-            try:
-                await message.delete()
-            except:
-                pass
-            await log_action(guild, "AutoMod - Link Removed", f"{message.author.mention} posted a link.")
-            try:
-                await message.author.send("⚠️ Links are not allowed in this server.")
-            except:
-                pass
-            return
-
-    # Caps filter
-    if cfg.get("filters", {}).get("caps_filter", True):
-        # check if message has >10 characters and is mostly uppercase letters
-        stripped = re.sub(r'[^A-Za-z]', '', content)
-        if len(stripped) >= 10 and stripped.isupper():
-            try:
-                await message.delete()
-            except:
-                pass
-            await log_action(guild, "AutoMod - Caps Removed", f"{message.author.mention} used excessive caps.")
-            try:
-                await message.author.send("🧢 Please avoid using excessive caps.")
-            except:
-                pass
-            return
-
-    # Anti-spam: >5 messages within 5 seconds
-    if cfg.get("filters", {}).get("anti_spam", True):
-        uid = message.author.id
-        now = time.time()
-        arr = user_message_timestamps.get(uid, [])
-        arr = [t for t in arr if now - t < 5]
-        arr.append(now)
-        user_message_timestamps[uid] = arr
-        if len(arr) > 5:
-            try:
-                await message.delete()
-            except:
-                pass
-            await log_action(guild, "AutoMod - Spam", f"{message.author.mention} is spamming.")
-            try:
-                await message.author.send("⛔ Please slow down — you are sending messages too quickly.")
-            except:
-                pass
-            return
-
-    # XP processing (only for non-bot users)
-    await process_xp_on_message(message)
-
-    # process commands after checks
-    await bot.process_commands(message)
-
-# ----------------------------------------
-# Persistence helpers (sync & async wrappings)
-# ----------------------------------------
-def get_sync(fname_key):
-    return load_json_sync(DATA_FILES[fname_key])
-
-async def get_async(fname_key):
-    return await load_json(DATA_FILES[fname_key])
-
-def save_sync_key(fname_key, data):
-    save_json_sync(DATA_FILES[fname_key], data)
-
-async def save_async_key(fname_key, data):
-    await save_json(DATA_FILES[fname_key], data)
-
-# ----------------------------------------
-# Warnings system
-# ----------------------------------------
-def load_warnings_sync():
-    return get_sync("warnings")
-
-def save_warnings_sync(obj):
-    save_sync_key("warnings", obj)
-
-async def load_warnings():
-    return await get_async("warnings")
-
-async def save_warnings(obj):
-    await save_async_key("warnings", obj)
-
-# warn command (slash)
-@bot.tree.command(name="warn", description="Warn a member (moderators only)")
-@app_commands.checks.has_permissions(manage_messages=True)
-@app_commands.describe(member="Member to warn", reason="Reason for warning")
-async def warn(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
-    try:
-        warnings = await load_warnings()
-        uid = str(member.id)
-        warnings.setdefault(uid, [])
-        entry = {"moderator": str(interaction.user), "reason": reason, "time": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}
-        warnings[uid].append(entry)
-        await save_warnings(warnings)
-
-        await interaction.response.send_message(f"⚠️ Warned {member.mention}. Reason: {reason}")
-        await log_action(interaction.guild, "Warn Issued", f"{member.mention} warned by {interaction.user}: {reason}", color=discord.Color.gold())
-
-        try:
-            await member.send(f"⚠️ You were warned in **{interaction.guild.name}**. Reason: {reason}")
-        except:
-            pass
-
-        # check auto-ban (5 warnings)
-        await check_auto_ban(interaction.guild, member, warnings)
-
-    except Exception as e:
-        traceback.print_exc()
-        await interaction.response.send_message("❌ Failed to warn (see logs).")
-
-@bot.tree.command(name="warnings", description="Show warnings for a member")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def warnings_cmd(interaction: discord.Interaction, member: discord.Member):
-    warnings = await load_warnings()
+def xp_add_message(member: discord.Member):
+    if member.bot: return
+    gid = str(member.guild.id)
     uid = str(member.id)
-    arr = warnings.get(uid, [])
-    if not arr:
-        await interaction.response.send_message(f"✅ {member.mention} has no warnings.")
-        return
-    embed = discord.Embed(title=f"⚠️ Warnings for {member}", color=discord.Color.orange())
-    for i, w in enumerate(arr, start=1):
-        embed.add_field(name=f"Warning #{i}", value=f"**Moderator:** {w['moderator']}\n**Reason:** {w['reason']}\n**Date:** {w['time']}", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="clearwarns", description="Clear all warnings for a member")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def clearwarns(interaction: discord.Interaction, member: discord.Member):
-    warnings = await load_warnings()
-    uid = str(member.id)
-    if uid in warnings:
-        warnings.pop(uid, None)
-        await save_warnings(warnings)
-        await interaction.response.send_message(f"✅ Cleared warnings for {member.mention}.")
-        await log_action(interaction.guild, "Clear Warnings", f"{member.mention} cleared by {interaction.user}")
-    else:
-        await interaction.response.send_message("⚠️ That user has no warnings.")
-
-# helper for tiered discipline
-async def check_auto_ban(guild: discord.Guild, member: discord.Member, warnings_data=None):
-    # if warnings_data provided, use it; otherwise load
-    if warnings_data is None:
-        warnings_data = await load_warnings()
-    uid = str(member.id)
-    total = len(warnings_data.get(uid, []))
-    if total >= 5:
+    key = f"{gid}-{uid}"
+    entry = xp_data.get(key, {"xp": 0, "level": 0})
+    gain = random.randint(8, 16)
+    entry["xp"] += gain
+    new_lvl = xp_to_level(entry["xp"])
+    if new_lvl > entry.get("level", 0):
+        entry["level"] = new_lvl
+        # Level up announcements (try system channel, fallback to guild default, else ignore)
         try:
-            await guild.ban(member, reason="Exceeded 5 warnings (Auto-ban)")
-            await log_action(guild, "Auto-Ban", f"{member} was auto-banned after {total} warnings.", color=discord.Color.red())
-            try:
-                await member.send(f"🚫 You were automatically banned from **{guild.name}** after receiving {total} warnings.")
-            except:
-                pass
-            # clear warnings after ban
-            warnings_data.pop(uid, None)
-            await save_warnings(warnings_data)
-        except discord.Forbidden:
-            await log_action(guild, "Auto-Ban Failed", f"Missing permissions to ban {member}.", color=discord.Color.orange())
+            gcfg = guild_config(member.guild.id)
+            msg = f"🎉 {member.mention} leveled up to **{new_lvl}**!"
+            # send to log channel if exists otherwise system channel
+            dest = None
+            if gcfg.get("log_channel"):
+                dest = member.guild.get_channel(int(gcfg["log_channel"]))
+            if not dest and member.guild.system_channel:
+                dest = member.guild.system_channel
+            if dest:
+                asyncio.create_task(dest.send(msg))
         except Exception:
-            traceback.print_exc()
-
-# ----------------------------------------
-# Timeout system + tracking
-# ----------------------------------------
-def parse_duration_to_seconds(s: str):
-    # supports formats like 10s 5m 1h 2d
-    try:
-        val = int(s[:-1])
-        unit = s[-1].lower()
-        mult = {'s':1,'m':60,'h':3600,'d':86400}
-        return val * mult.get(unit, 0)
-    except Exception:
-        return None
-
-# async load/save timeouts
-async def load_timeouts():
-    return await get_async("timeouts")
-async def save_timeouts(data):
-    await save_async_key("timeouts", data)
-
-@bot.tree.command(name="timeout", description="Temporarily timeout a member")
-@app_commands.checks.has_permissions(moderate_members=True)
-@app_commands.describe(member="Member to timeout", duration="Duration like 10s, 5m, 1h, 1d", reason="Reason")
-async def timeout_cmd(interaction: discord.Interaction, member: discord.Member, duration: str, reason: str = "No reason provided"):
-    sec = parse_duration_to_seconds(duration)
-    if sec is None or sec <= 0:
-        await interaction.response.send_message("❌ Invalid duration format. Use like `10s`, `5m`, `1h`, `1d`.")
-        return
-    until = discord.utils.utcnow() + datetime.timedelta(seconds=sec)
-
-    try:
-        await member.timeout(until, reason=reason)
-        await interaction.response.send_message(f"⏳ {member.mention} timed out for {duration}. Reason: {reason}")
-        await log_action(interaction.guild, "Timeout", f"{member} timed out by {interaction.user} for {duration}. Reason: {reason}", color=discord.Color.orange())
-
-        # store timeout history
-        tdata = await load_timeouts()
-        uid = str(member.id)
-        tdata.setdefault(uid, [])
-        tdata[uid].append({"moderator": str(interaction.user), "duration": duration, "reason": reason, "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")})
-        await save_timeouts(tdata)
-
-        # DM user
-        try:
-            await member.send(f"⏳ You were timed out in **{interaction.guild.name}** for {duration}. Reason: {reason}")
-        except:
             pass
+        # role rewards
+        gcfg = guild_config(member.guild.id)
+        rewards = gcfg.get("level_rewards", {})
+        rid = rewards.get(str(new_lvl))
+        if rid:
+            role = member.guild.get_role(int(rid))
+            if role:
+                try:
+                    asyncio.create_task(member.add_roles(role))
+                except:
+                    pass
+    xp_data[key] = entry
+    save_xp()
 
-        # if timeouts >=3 -> auto warn
-        if len(tdata[uid]) >= 3:
-            warnings = await load_warnings()
-            warnings.setdefault(uid, [])
-            warnings[uid].append({"moderator":"Auto-Mod", "reason":"3 timeouts (auto-warn)", "time": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")})
-            await save_warnings(warnings)
-            await log_action(interaction.guild, "Auto-Warn", f"{member} auto-warned for 3 timeouts.", color=discord.Color.gold())
-            try:
-                await member.send("⚠️ You have been auto-warned for receiving 3 timeouts.")
-            except:
-                pass
-            # after auto-warn, check auto-ban
-            await check_auto_ban(interaction.guild, member, warnings)
-    except discord.Forbidden:
-        await interaction.response.send_message("⚠️ Missing permissions to timeout that user.")
-    except Exception as e:
-        traceback.print_exc()
-        await interaction.response.send_message("❌ Error while timing out the user.")
+# ---------------------------
+# Ticket system (button)
+# ---------------------------
+class TicketCloseView(View):
+    def __init__(self, channel_id):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
 
-@bot.tree.command(name="untimeout", description="Remove timeout from a user")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def untimeout_cmd(interaction: discord.Interaction, member: discord.Member):
-    try:
-        await member.timeout(None)
-        await interaction.response.send_message(f"✅ Timeout removed for {member.mention}.")
-        await log_action(interaction.guild, "Timeout Removed", f"{member} timeout removed by {interaction.user}")
-        try:
-            await member.send(f"✅ Your timeout has been removed in **{interaction.guild.name}**.")
-        except:
-            pass
-    except discord.Forbidden:
-        await interaction.response.send_message("⚠️ Missing permissions to modify that user.")
-    except Exception:
-        traceback.print_exc()
-        await interaction.response.send_message("❌ Error while removing timeout.")
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="close_ticket_btn")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.client.get_channel(self.channel_id)
+        if not channel:
+            await interaction.response.send_message("Channel not found.", ephemeral=True)
+            return
+        # transcript
+        msgs = []
+        async for m in channel.history(limit=1000, oldest_first=True):
+            t = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            content = m.content or ""
+            msgs.append(f"[{t}] {m.author}: {content}")
+        transcript = "\n".join(msgs)
+        tfile = os.path.join(TICKETS_DIR, f"{channel.guild.id}_{channel.id}.txt")
+        with open(tfile, "w", encoding="utf-8") as f:
+            f.write(transcript)
+        # send transcript to log channel if set
+        gcfg = guild_config(channel.guild.id)
+        lid = gcfg.get("log_channel")
+        if lid:
+            logch = channel.guild.get_channel(int(lid))
+            if logch:
+                try:
+                    await logch.send(f"📄 Ticket {channel.name} closed by {interaction.user}. Transcript:", file=discord.File(tfile))
+                except:
+                    pass
+        await channel.delete()
 
-@bot.tree.command(name="timeouts", description="Show timeout history for a user")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def timeouts_cmd(interaction: discord.Interaction, member: discord.Member):
-    tdata = await load_timeouts()
-    uid = str(member.id)
-    arr = tdata.get(uid, [])
-    if not arr:
-        await interaction.response.send_message(f"✅ {member.mention} has no timeouts recorded.")
-        return
-    embed = discord.Embed(title=f"⏳ Timeouts for {member}", color=discord.Color.orange())
-    for i, r in enumerate(arr[-10:], start=1):
-        embed.add_field(name=f"#{i}", value=f"**Moderator:** {r['moderator']}\n**Duration:** {r['duration']}\n**Reason:** {r['reason']}\n**When:** {r['timestamp']}", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+class TicketCreateView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
 
-# ----------------------------------------
-# XP & Leveling system
-# ----------------------------------------
-# Simple design:
-# xp.json stores guild_member_key -> {"xp": int, "level": int}
-# Level formula: level increases when xp >= 50*level^2 + 50*level (same as earlier)
-async def load_xp_data():
-    return await get_async("xp")
+    @discord.ui.button(label="Create Ticket", style=discord.ButtonStyle.green, custom_id="create_ticket_btn")
+    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        gcfg = guild_config(guild.id)
+        category_id = gcfg.get("ticket_category")
+        category = guild.get_channel(int(category_id)) if category_id else None
+        staff_role_id = gcfg.get("staff_role")
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True)
+        }
+        if staff_role_id:
+            r = guild.get_role(int(staff_role_id))
+            if r:
+                overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+        base = f"ticket-{interaction.user.name}".lower()
+        suffix = random.randint(1000, 9999)
+        name = f"{base}-{suffix}"
+        channel = await guild.create_text_channel(name, overwrites=overwrites, category=category)
+        view = TicketCloseView(channel.id)
+        await channel.send(f"{interaction.user.mention} Ticket created. Staff will be with you soon.", view=view)
+        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        log_action(guild, f"🎫 Ticket created: {channel.name} by {interaction.user}")
 
-async def save_xp_data(d):
-    await save_async_key("xp", d)
-
-def xp_required_for_level(lvl):
-    return 50 * (lvl ** 2) + 50 * lvl
-
-async def process_xp_on_message(message: discord.Message):
-    # award xp for chat activity (non-bot)
-    if message.author.bot or not message.guild:
-        return
-    key = f"{message.guild.id}-{message.author.id}"
-    xp_db = await load_xp_data()
-    user = xp_db.get(key, {"xp":0, "level":0})
-    # basic cooldown (per-user in-memory)
-    now = time.time()
-    # using a simple attribute on bot is OK
-    cooldowns = getattr(bot, "_xp_cooldowns", {})
-    last = cooldowns.get(key, 0)
-    if now - last < 30:  # 30s cooldown
-        return
-    gain = 8 + int((time.time() * 1000) % 9)  # simple pseudo-random small gain
-    user["xp"] = user.get("xp",0) + gain
-    new_level = user.get("level",0)
-    while user["xp"] >= xp_required_for_level(new_level):
-        new_level += 1
-    if new_level > user.get("level",0):
-        user["level"] = new_level
-        # announce level up in the channel
-        try:
-            await message.channel.send(f"🎉 {message.author.mention} leveled up to **Level {new_level}**!")
-            # check role rewards in config
-            cfg = get_config_sync()
-            rewards = cfg.get("level_rewards", {})
-            role_id = rewards.get(str(new_level))
-            if role_id:
-                role = message.guild.get_role(int(role_id))
-                if role:
-                    try:
-                        await message.author.add_roles(role)
-                        try:
-                            await message.author.send(f"🏅 You received the **{role.name}** role for reaching Level {new_level}!")
-                        except:
-                            pass
-                    except:
-                        pass
-        except:
-            pass
-    xp_db[key] = user
-    await save_xp_data(xp_db)
-    cooldowns[key] = now
-    bot._xp_cooldowns = cooldowns
-
-# slash to show xp/level
-@bot.tree.command(name="xp", description="Show your XP and level")
-async def xp_cmd(interaction: discord.Interaction, member: discord.Member = None):
-    member = member or interaction.user
-    xp_db = await load_xp_data()
-    key = f"{interaction.guild.id}-{member.id}"
-    user = xp_db.get(key, {"xp":0, "level":0})
-    xp = user.get("xp",0)
-    level = user.get("level",0)
-    next_req = xp_required_for_level(level)
-    embed = discord.Embed(title=f"🏆 XP for {member}", color=discord.Color.blurple())
-    embed.add_field(name="Level", value=str(level), inline=True)
-    embed.add_field(name="XP", value=str(xp), inline=True)
-    embed.add_field(name="XP for next level", value=str(next_req), inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ----------------------------------------
-# Reaction Role system (button panels + reaction fallback)
-# reaction_panels.json schema:
-# { "<message_id>": {"guild_id": "<gid>", "type": "button"|"reaction", "roles": {"emoji_str": role_id}} }
-# ----------------------------------------
-def load_reaction_sync():
-    return get_sync("reaction")
-def save_reaction_sync(data):
-    save_sync_key("reaction", data)
-
-async def load_reaction_async():
-    return await get_async("reaction")
-async def save_reaction_async(data):
-    await save_async_key("reaction", data)
+# ---------------------------
+# Reaction role system
+# ---------------------------
+def save_reaction_panels():
+    save_json(REACTION_FILE, reaction_panels)
 
 class ReactionRoleView(View):
     def __init__(self, message_id):
         super().__init__(timeout=None)
-        self.msg_id = str(message_id)
-        # dynamically add buttons per stored panel
-        panels = load_reaction_sync()
-        panel = panels.get(self.msg_id, {})
-        roles = panel.get("roles", {})
-        for emoji, role_id in roles.items():
+        self.message_id = str(message_id)
+        panel = reaction_panels.get(self.message_id, {})
+        for emoji, rid in panel.get("roles", {}).items():
             try:
-                # button custom_id encoding
-                btn = Button(emoji=emoji if len(emoji) <= 2 else None, label="" if len(emoji) <= 2 else emoji, style=discord.ButtonStyle.secondary, custom_id=f"rr|{self.msg_id}|{role_id}")
+                btn = Button(emoji=emoji, style=discord.ButtonStyle.secondary, custom_id=f"rr|{self.message_id}|{rid}")
                 self.add_item(btn)
             except Exception:
                 pass
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
-    # handle reaction-role button callback
-    if interaction.type.value != 3 and interaction.data is None:
-        return
-    # check custom_id
-    data = interaction.data or {}
-    cid = data.get("custom_id")
-    if not cid:
-        return
-    if isinstance(cid, str) and cid.startswith("rr|"):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            _, msg_id, role_id = cid.split("|")
+    try:
+        data = getattr(interaction, "data", None)
+        if not data:
+            return
+        cid = data.get("custom_id")
+        if not cid:
+            return
+        if cid.startswith("rr|"):
+            await interaction.response.defer(ephemeral=True)
+            _, mid, rid = cid.split("|")
             guild = interaction.guild
             member = interaction.user
-            role = guild.get_role(int(role_id))
-            if not role:
-                await interaction.followup.send("⚠️ That role no longer exists.", ephemeral=True)
-                return
+            role = guild.get_role(int(rid))
             if role in member.roles:
                 await member.remove_roles(role)
                 await interaction.followup.send(f"❎ Removed **{role.name}**.", ephemeral=True)
-                await log_action(guild, "Reaction Role Removed", f"{member} removed role {role.name}")
+                log_action(guild, f"🎭 Reaction role removed: {member} - {role.name}")
             else:
                 await member.add_roles(role)
-                await interaction.followup.send(f"✅ Added **{role.name}**!", ephemeral=True)
-                await log_action(guild, "Reaction Role Added", f"{member} added role {role.name}")
-        except Exception:
-            traceback.print_exc()
-        return
+                await interaction.followup.send(f"✅ Added **{role.name}**.", ephemeral=True)
+                log_action(guild, f"🎭 Reaction role added: {member} - {role.name}")
+    except Exception:
+        print("on_interaction error:", traceback.format_exc())
 
-# legacy reaction add/remove
 @bot.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.user_id == bot.user.id:
-        return
-    panels = load_reaction_sync()
-    panel = panels.get(str(payload.message_id))
-    if not panel or panel.get("type") != "reaction":
-        return
-    guild = bot.get_guild(payload.guild_id)
-    emoji_str = str(payload.emoji)
-    role_id = panel.get("roles", {}).get(emoji_str) or panel.get("roles", {}).get(payload.emoji.name)
-    if not role_id:
-        return
-    role = guild.get_role(int(role_id))
-    member = guild.get_member(payload.user_id)
-    if role and member:
-        try:
+async def on_raw_reaction_add(payload):
+    try:
+        if str(payload.message_id) not in reaction_panels: return
+        panel = reaction_panels[str(payload.message_id)]
+        if panel.get("type") != "reaction": return
+        emoji = str(payload.emoji)
+        rid = panel.get("roles", {}).get(emoji) or panel.get("roles", {}).get(payload.emoji.name)
+        if not rid: return
+        g = bot.get_guild(payload.guild_id)
+        if not g: return
+        member = g.get_member(payload.user_id)
+        if not member: return
+        role = g.get_role(int(rid))
+        if role:
             await member.add_roles(role)
-            await log_action(guild, "Reaction Role Added", f"{member} added role {role.name}")
-        except:
-            pass
+            log_action(g, f"🎭 Reaction role added: {member} - {role.name}")
+    except Exception:
+        print("on_raw_reaction_add error:", traceback.format_exc())
 
 @bot.event
-async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    panels = load_reaction_sync()
-    panel = panels.get(str(payload.message_id))
-    if not panel or panel.get("type") != "reaction":
-        return
-    guild = bot.get_guild(payload.guild_id)
-    emoji_str = str(payload.emoji)
-    role_id = panel.get("roles", {}).get(emoji_str) or panel.get("roles", {}).get(payload.emoji.name)
-    if not role_id:
-        return
-    role = guild.get_role(int(role_id))
-    member = guild.get_member(payload.user_id)
-    if role and member:
-        try:
+async def on_raw_reaction_remove(payload):
+    try:
+        if str(payload.message_id) not in reaction_panels: return
+        panel = reaction_panels[str(payload.message_id)]
+        if panel.get("type") != "reaction": return
+        emoji = str(payload.emoji)
+        rid = panel.get("roles", {}).get(emoji) or panel.get("roles", {}).get(payload.emoji.name)
+        if not rid: return
+        g = bot.get_guild(payload.guild_id)
+        if not g: return
+        member = g.get_member(payload.user_id)
+        if not member: return
+        role = g.get_role(int(rid))
+        if role:
             await member.remove_roles(role)
-            await log_action(guild, "Reaction Role Removed", f"{member} removed role {role.name}")
-        except:
-            pass
+            log_action(g, f"🎭 Reaction role removed: {member} - {role.name}")
+    except Exception:
+        print("on_raw_reaction_remove error:", traceback.format_exc())
 
-# commands to create reaction panel
-@bot.tree.command(name="reactionpanel", description="Create a reaction role panel (button or reaction)")
-@app_commands.describe(panel_type="button or reaction", message="Message content for the panel")
-@app_commands.checks.has_permissions(manage_roles=True)
-async def reactionpanel(interaction: discord.Interaction, panel_type: str = "button", message: str = "Pick your roles!"):
-    # send a message and register panel
-    if panel_type not in ("button","reaction"):
-        await interaction.response.send_message("Panel type must be 'button' or 'reaction'.", ephemeral=True)
-        return
-    sent = await interaction.channel.send(embed=discord.Embed(title="Reaction Roles", description=message, color=discord.Color.blurple()))
-    panels = load_reaction_sync()
-    panels[str(sent.id)] = {"guild_id": str(interaction.guild.id), "type": panel_type, "roles": {}}
-    save_reaction_sync(panels)
-    if panel_type == "button":
-        try:
-            await sent.edit(view=ReactionRoleView(sent.id))
-        except:
-            pass
-    await interaction.response.send_message(f"✅ Reaction panel created (message id: {sent.id}). Use /addreactionrole to add roles.", ephemeral=True)
+# ---------------------------
+# Warnings, Timeouts, Tiered discipline
+# ---------------------------
+def load_warnings():
+    global warnings_data
+    warnings_data = ensure_json(WARN_FILE, {})
+    return warnings_data
 
-@bot.tree.command(name="addreactionrole", description="Add an emoji->role mapping to a panel")
-@app_commands.describe(message_id="The panel message id", emoji="Emoji to use", role="Role to assign")
-@app_commands.checks.has_permissions(manage_roles=True)
-async def addreactionrole(interaction: discord.Interaction, message_id: str, emoji: str, role: discord.Role):
-    panels = load_reaction_sync()
-    panel = panels.get(str(message_id))
-    if not panel:
-        await interaction.response.send_message("❌ Panel not found.", ephemeral=True)
-        return
-    panel["roles"][emoji] = role.id
-    save_reaction_sync(panels)
-    # if button panel, try to rebuild view
-    if panel["type"] == "button":
+def save_warnings(data):
+    save_json(WARN_FILE, data)
+
+def load_timeouts():
+    global timeouts_data
+    timeouts_data = ensure_json(TIMEOUTS_FILE, {})
+    return timeouts_data
+
+def save_timeouts(data):
+    save_json(TIMEOUTS_FILE, data)
+
+async def check_auto_ban(guild: discord.Guild, member: discord.Member):
+    warnings = load_warnings()
+    uid = str(member.id)
+    total = len(warnings.get(uid, []))
+    if total >= 5:
         try:
-            # fetch message
-            channel = interaction.channel
+            await member.ban(reason="Auto-ban: exceeded 5 warnings")
+            log_action(guild, f"🚫 Auto-ban: {member} (warnings: {total})")
             try:
-                msg = await channel.fetch_message(int(message_id))
+                await member.send(f"🚫 You were automatically banned from **{guild.name}** after receiving {total} warnings.")
             except:
-                # try searching all channels (expensive); best practice: run command in same channel as panel
-                msg = None
-                for ch in interaction.guild.text_channels:
-                    try:
-                        candidate = await ch.fetch_message(int(message_id))
-                        msg = candidate
-                        break
-                    except:
-                        pass
-            if msg:
-                await msg.edit(view=ReactionRoleView(message_id))
-        except:
-            traceback.print_exc()
-    else:
-        # reaction panel, add reaction to message if bot can access it
-        try:
-            # find the message similarly
-            msg = None
-            for ch in interaction.guild.text_channels:
+                pass
+            warnings.pop(uid, None)
+            save_warnings(warnings)
+        except Exception:
+            log_action(guild, f"⚠️ Auto-ban failed for {member} (missing perms?)")
+
+# ---------------------------
+# Auto-moderation (anti-link, anti-spam, caps) and XP granting
+# ---------------------------
+user_message_times = {}
+
+@bot.event
+async def on_message(message: discord.Message):
+    try:
+        if message.author.bot:
+            return
+
+        # Always process commands first
+        await bot.process_commands(message)
+
+        if not message.guild:
+            # allow XP in guild-only; skip DMs for auto-mod
+            return
+
+        gcfg = guild_config(message.guild.id)
+        content = message.content or ""
+        lower = content.lower()
+
+        # anti-link
+        if gcfg["filters"].get("anti_link", True):
+            if re.search(r"https?:\/\/\S+", lower):
                 try:
-                    candidate = await ch.fetch_message(int(message_id))
-                    msg = candidate
-                    break
+                    await message.delete()
                 except:
                     pass
-            if msg:
-                await msg.add_reaction(emoji)
-        except:
-            pass
-    await interaction.response.send_message(f"✅ Linked {emoji} → {role.mention} in panel {message_id}", ephemeral=True)
-
-# ----------------------------------------
-# Ticket system (button to create ticket; per-guild ticket category optional)
-# tickets.json stores active tickets metadata if needed
-# ----------------------------------------
-def load_tickets_sync():
-    return get_sync("tickets")
-def save_tickets_sync(data):
-    save_sync_key("tickets", data)
-
-async def load_tickets_async():
-    return await get_async("tickets")
-async def save_tickets_async(data):
-    await save_async_key("tickets", data)
-
-class TicketCreateView(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-    @discord.ui.button(label="Create Ticket 🎫", style=discord.ButtonStyle.green, custom_id="create_ticket_btn")
-    async def create_button(self, interaction: discord.Interaction, button: Button):
-        guild = interaction.guild
-        cfg = get_config_sync()
-        category_id = cfg.get("ticket_category")
-        category = guild.get_channel(int(category_id)) if category_id else None
-        # make unique channel name
-        base = f"ticket-{interaction.user.name}".lower().replace(" ", "-")
-        suffix = str(int(time.time()))[-4:]
-        channel_name = f"{base}-{suffix}"
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True)
-        }
-        staff_role_id = cfg.get("staff_role")
-        if staff_role_id:
-            staff_role = guild.get_role(int(staff_role_id))
-            if staff_role:
-                overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-        channel = await guild.create_text_channel(channel_name, overwrites=overwrites, category=category)
-        # send initial message with close button
-        close_view = TicketCloseView()
-        em = discord.Embed(title="🎟️ Ticket Created", description=f"{interaction.user.mention} — a staff member will be with you shortly.\nClick Close when finished.", color=discord.Color.green())
-        await channel.send(content=interaction.user.mention, embed=em, view=close_view)
-        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
-        await log_action(guild, "Ticket Created", f"Ticket {channel.name} created by {interaction.user}")
-
-class TicketCloseView(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-    @discord.ui.button(label="Close Ticket 🔒", style=discord.ButtonStyle.red, custom_id="close_ticket_btn")
-    async def close_button(self, interaction: discord.Interaction, button: Button):
-        channel = interaction.channel
-        # gather last messages as transcript
-        messages = []
-        try:
-            async for m in channel.history(limit=1000, oldest_first=True):
-                timestamp = m.created_at.strftime("%Y-%m-%d %H:%M:%S")
-                messages.append(f"[{timestamp}] {m.author}: {m.content}")
-        except:
-            pass
-        transcript = "\n".join(messages)
-        # post transcript to log channel if exists
-        cfg = get_config_sync()
-        log_id = cfg.get("log_channel")
-        if log_id:
-            log_ch = channel.guild.get_channel(int(log_id))
-            if log_ch:
+                log_action(message.guild, f"🚫 Link removed from {message.author}")
                 try:
-                    await log_ch.send(embed=discord.Embed(title="Ticket Transcript", description=f"Ticket closed: {channel.name}", color=discord.Color.dark_grey()))
-                    if transcript:
-                        # if transcript is long, send as file
-                        if len(transcript) > 1900:
-                            await log_ch.send(file=discord.File(fp=discord.utils.snowflake_time(1), filename="transcript.txt"))
-                        else:
-                            await log_ch.send(f"```{transcript[:1900]}```")
+                    await message.author.send(f"⚠️ Links are not allowed in {message.guild.name}.")
                 except:
                     pass
+                return
+
+        # caps filter
+        if gcfg["filters"].get("caps_filter", True):
+            if len(content) > 10 and content.isupper():
+                try:
+                    await message.delete()
+                except:
+                    pass
+                log_action(message.guild, f"🧢 Caps message deleted from {message.author}")
+                try:
+                    await message.author.send("🧢 Please avoid excessive caps.")
+                except:
+                    pass
+                return
+
+        # anti-spam
+        if gcfg["filters"].get("anti_spam", True):
+            nowt = time.time()
+            lst = user_message_times.get(message.author.id, [])
+            lst = [t for t in lst if nowt - t < 5]
+            lst.append(nowt)
+            user_message_times[message.author.id] = lst
+            if len(lst) > 5:
+                try:
+                    await message.delete()
+                except:
+                    pass
+                log_action(message.guild, f"🚷 Spam: {message.author}")
+                try:
+                    await message.author.send("⛔ Slow down — you're sending messages too quickly.")
+                except:
+                    pass
+                return
+
+        # XP
         try:
-            await channel.delete()
-        except:
+            xp_add_message(message.author)
+        except Exception:
             pass
 
-# command to create a ticket panel with create button
-@bot.tree.command(name="ticketpanel", description="Create a ticket creation panel (staff role optional)")
-@app_commands.checks.has_permissions(manage_guild=True)
-@app_commands.describe(message="Intro text for the ticket panel")
-async def ticketpanel(interaction: discord.Interaction, message: str = "Click the button to create a ticket"):
-    view = TicketCreateView()
-    await interaction.response.send_message(embed=discord.Embed(title="Support Ticket", description=message, color=discord.Color.green()), view=view)
-    await log_action(interaction.guild, "Ticket Panel Created", f"{interaction.user} created a ticket panel.")
+    except Exception:
+        print("on_message error:", traceback.format_exc())
 
-# ----------------------------------------
-# Setup commands: setwelcome/setgoodbye/setlog/staff role/ticket category/level reward/premium
-# ----------------------------------------
+# ---------------------------
+# Slash & command implementations
+# ---------------------------
+
+# Setup commands
 @bot.tree.command(name="setwelcome", description="Set welcome channel")
 @app_commands.checks.has_permissions(administrator=True)
 async def setwelcome(interaction: discord.Interaction, channel: discord.TextChannel):
-    cfg = get_config_sync()
-    cfg["welcome_channel"] = str(channel.id)
-    save_json_sync(DATA_FILES["config"], cfg)
-    await interaction.response.send_message(f"✅ Welcome channel set to {channel.mention}")
+    gcfg = guild_config(interaction.guild.id)
+    gcfg["welcome_channel"] = str(channel.id)
+    save_json(CONFIG_FILE, config)
+    await interaction.response.send_message(f"✅ Welcome channel set to {channel.mention}", ephemeral=True)
 
 @bot.tree.command(name="setgoodbye", description="Set goodbye channel")
 @app_commands.checks.has_permissions(administrator=True)
 async def setgoodbye(interaction: discord.Interaction, channel: discord.TextChannel):
-    cfg = get_config_sync()
-    cfg["goodbye_channel"] = str(channel.id)
-    save_json_sync(DATA_FILES["config"], cfg)
-    await interaction.response.send_message(f"✅ Goodbye channel set to {channel.mention}")
+    gcfg = guild_config(interaction.guild.id)
+    gcfg["goodbye_channel"] = str(channel.id)
+    save_json(CONFIG_FILE, config)
+    await interaction.response.send_message(f"✅ Goodbye channel set to {channel.mention}", ephemeral=True)
 
-@bot.tree.command(name="setlog", description="Set mod-log channel")
+@bot.tree.command(name="setlog", description="Set log channel")
 @app_commands.checks.has_permissions(administrator=True)
 async def setlog(interaction: discord.Interaction, channel: discord.TextChannel):
-    cfg = get_config_sync()
-    cfg["log_channel"] = str(channel.id)
-    save_json_sync(DATA_FILES["config"], cfg)
-    await interaction.response.send_message(f"✅ Log channel set to {channel.mention}")
+    gcfg = guild_config(interaction.guild.id)
+    gcfg["log_channel"] = str(channel.id)
+    save_json(CONFIG_FILE, config)
+    await interaction.response.send_message(f"✅ Log channel set to {channel.mention}", ephemeral=True)
 
-@bot.tree.command(name="setstaffrole", description="Set staff role for ticket visibility")
+@bot.tree.command(name="setwelcomedm", description="Set custom welcome DM (use {user} and {server})")
 @app_commands.checks.has_permissions(administrator=True)
-async def setstaffrole(interaction: discord.Interaction, role: discord.Role):
-    cfg = get_config_sync()
-    cfg["staff_role"] = str(role.id)
-    save_json_sync(DATA_FILES["config"], cfg)
-    await interaction.response.send_message(f"✅ Staff role set to {role.name}")
+async def setwelcomedm(interaction: discord.Interaction, *, message: str):
+    gcfg = guild_config(interaction.guild.id)
+    gcfg["welcome_dm"] = message
+    save_json(CONFIG_FILE, config)
+    await interaction.response.send_message("✅ Welcome DM updated.", ephemeral=True)
 
-@bot.tree.command(name="setticketcategory", description="Set ticket category (optional)")
-@app_commands.checks.has_permissions(administrator=True)
-async def setticketcategory(interaction: discord.Interaction, category: discord.CategoryChannel):
-    cfg = get_config_sync()
-    cfg["ticket_category"] = str(category.id)
-    save_json_sync(DATA_FILES["config"], cfg)
-    await interaction.response.send_message(f"✅ Ticket category set to {category.name}")
+# Moderation commands
+@bot.tree.command(name="kick", description="Kick a member")
+@app_commands.checks.has_permissions(kick_members=True)
+@app_commands.describe(member="Member to kick", reason="Reason")
+async def slash_kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    try:
+        await member.kick(reason=reason)
+        await interaction.response.send_message(f"👢 {member.mention} kicked. Reason: {reason}")
+        log_action(interaction.guild, f"👢 Kick: {member} by {interaction.user} — {reason}")
+        try:
+            await member.send(f"👢 You were kicked from {interaction.guild.name}. Reason: {reason}")
+        except:
+            pass
+    except Exception:
+        await interaction.response.send_message("❌ Failed to kick (permissions?).", ephemeral=True)
 
-@bot.tree.command(name="setlevelreward", description="Set a role reward for reaching a level")
-@app_commands.checks.has_permissions(administrator=True)
-async def setlevelreward(interaction: discord.Interaction, level: int, role: discord.Role):
-    cfg = get_config_sync()
-    lr = cfg.get("level_rewards", {})
-    lr[str(level)] = str(role.id)
-    cfg["level_rewards"] = lr
-    save_json_sync(DATA_FILES["config"], cfg)
-    await interaction.response.send_message(f"✅ Role {role.name} will be awarded at level {level}.")
+@bot.tree.command(name="ban", description="Ban a member")
+@app_commands.checks.has_permissions(ban_members=True)
+@app_commands.describe(member="Member to ban", reason="Reason")
+async def slash_ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    try:
+        await member.ban(reason=reason)
+        await interaction.response.send_message(f"⛔ {member.mention} banned. Reason: {reason}")
+        log_action(interaction.guild, f"⛔ Ban: {member} by {interaction.user} — {reason}")
+        try:
+            await member.send(f"⛔ You were banned from {interaction.guild.name}. Reason: {reason}")
+        except:
+            pass
+    except Exception:
+        await interaction.response.send_message("❌ Failed to ban (permissions?).", ephemeral=True)
 
-@bot.tree.command(name="setpremium", description="Mark this guild as premium (admin only)")
-@app_commands.checks.has_permissions(administrator=True)
-async def setpremium(interaction: discord.Interaction, enabled: bool):
-    cfg = get_config_sync()
-    pg = cfg.get("premium_guilds", [])
-    gid = str(interaction.guild.id)
-    if enabled:
-        if gid not in pg:
-            pg.append(gid)
-    else:
-        if gid in pg:
-            pg.remove(gid)
-    cfg["premium_guilds"] = pg
-    save_json_sync(DATA_FILES["config"], cfg)
-    await interaction.response.send_message(f"✅ Premium set to {enabled} for this server.")
+@bot.tree.command(name="unban", description="Unban a user by name#discriminator or ID")
+@app_commands.checks.has_permissions(ban_members=True)
+@app_commands.describe(user="username#discriminator or user id")
+async def slash_unban(interaction: discord.Interaction, user: str):
+    try:
+        if user.isdigit():
+            try:
+                await interaction.guild.unban(discord.Object(id=int(user)))
+                await interaction.response.send_message(f"✅ Unbanned id {user}", ephemeral=True)
+                return
+            except:
+                pass
+        if "#" in user:
+            name, discr = user.split("#", 1)
+            bans = await interaction.guild.bans()
+            for entry in bans:
+                u = entry.user
+                if u.name == name and u.discriminator == discr:
+                    await interaction.guild.unban(u)
+                    await interaction.response.send_message(f"✅ Unbanned {u}", ephemeral=True)
+                    return
+        await interaction.response.send_message("❌ User not found in bans.", ephemeral=True)
+    except Exception:
+        await interaction.response.send_message("❌ Failed to unban.", ephemeral=True)
 
-# ----------------------------------------
-# Infractions summary combining warnings + timeouts
-# ----------------------------------------
-@bot.tree.command(name="infractions", description="Show combined warnings and timeouts for a user")
+# Timeout/parsing
+def parse_duration(duration: str):
+    units = {'s':1,'m':60,'h':3600,'d':86400}
+    try:
+        val = int(duration[:-1])
+        unit = duration[-1]
+        return val * units[unit]
+    except Exception:
+        return None
+
+@bot.tree.command(name="timeout", description="Temporarily timeout a member (e.g., 10m, 1h)")
 @app_commands.checks.has_permissions(moderate_members=True)
-async def infractions(interaction: discord.Interaction, member: discord.Member):
-    warnings = await load_warnings()
-    tdata = await load_timeouts()
-    uid = str(member.id)
-    warns = warnings.get(uid, [])
-    touts = tdata.get(uid, [])
-    total_warns = len(warns)
-    total_timeouts = len(touts)
-    if total_warns == 0 and total_timeouts == 0:
-        await interaction.response.send_message(f"✅ {member.mention} has a clean record.", ephemeral=True)
+@app_commands.describe(member="Member", duration="10s,5m,1h,1d", reason="Reason")
+async def slash_timeout(interaction: discord.Interaction, member: discord.Member, duration: str, reason: str = "No reason provided"):
+    sec = parse_duration(duration)
+    if sec is None:
+        await interaction.response.send_message("❌ Invalid duration format.", ephemeral=True)
         return
-    embed = discord.Embed(title=f"📜 Infractions for {member}", color=discord.Color.red() if total_warns+total_timeouts>3 else discord.Color.orange())
+    try:
+        until = discord.utils.utcnow() + datetime.timedelta(seconds=sec)
+        await member.timeout(until, reason=reason)
+        await interaction.response.send_message(f"⏳ {member.mention} timed out for {duration}. Reason: {reason}")
+        log_action(interaction.guild, f"⏳ Timeout: {member} for {duration} by {interaction.user} — {reason}")
+        # record timeout
+        tdata = load_timeouts()
+        uid = str(member.id)
+        rec = {"moderator": str(interaction.user), "duration": duration, "reason": reason, "timestamp": now_iso()}
+        tdata.setdefault(uid, []).append(rec)
+        save_timeouts(tdata)
+        # auto-warn after 3 timeouts
+        if len(tdata.get(uid, [])) >= 3:
+            wdata = load_warnings()
+            wdata.setdefault(uid, []).append({"moderator":"Auto-Mod","reason":"3+ timeouts","time":now_iso()})
+            save_warnings(wdata)
+            log_action(interaction.guild, f"⚠️ Auto-warn: {member} after 3 timeouts.")
+            try:
+                await member.send("⚠️ You received an automatic warning for repeated timeouts.")
+            except:
+                pass
+            await check_auto_ban(interaction.guild, member)
+    except discord.Forbidden:
+        await interaction.response.send_message("⚠️ Missing permission to timeout that member.", ephemeral=True)
+    except Exception:
+        await interaction.response.send_message("❌ Timeout failed.", ephemeral=True)
+
+@bot.tree.command(name="untimeout", description="Remove a member's timeout")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def slash_untimeout(interaction: discord.Interaction, member: discord.Member):
+    try:
+        await member.timeout(None)
+        await interaction.response.send_message(f"✅ Timeout removed for {member.mention}")
+        log_action(interaction.guild, f"✅ Timeout removed: {member} by {interaction.user}")
+    except Exception:
+        await interaction.response.send_message("❌ Failed to remove timeout.", ephemeral=True)
+
+@bot.tree.command(name="timeouts", description="Show timeout history for a user")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def slash_timeouts(interaction: discord.Interaction, member: discord.Member):
+    tdata = load_timeouts()
+    uid = str(member.id)
+    items = tdata.get(uid, [])
+    if not items:
+        await interaction.response.send_message(f"No timeouts for {member.mention}", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"⏳ Timeouts for {member}", color=discord.Color.orange())
+    for i, rec in enumerate(items[-10:], start=1):
+        embed.add_field(name=f"#{i}", value=f"{rec['duration']} — {rec['reason']} by {rec['moderator']}\n{rec['timestamp']}", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# Warning system
+@bot.tree.command(name="warn", description="Warn a member")
+@app_commands.checks.has_permissions(manage_messages=True)
+@app_commands.describe(member="Member to warn", reason="Reason")
+async def slash_warn(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    w = load_warnings()
+    uid = str(member.id)
+    rec = {"moderator": str(interaction.user), "reason": reason, "time": now_iso()}
+    w.setdefault(uid, []).append(rec)
+    save_warnings(w)
+    await interaction.response.send_message(f"⚠️ Warned {member.mention}. Reason: {reason}")
+    log_action(interaction.guild, f"⚠️ Warn: {member} by {interaction.user} — {reason}")
+    try:
+        await member.send(f"⚠️ You were warned in {interaction.guild.name}. Reason: {reason}")
+    except:
+        pass
+    await check_auto_ban(interaction.guild, member)
+
+@bot.tree.command(name="warnings", description="Show warnings for a user")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def slash_warnings(interaction: discord.Interaction, member: discord.Member):
+    w = load_warnings()
+    uid = str(member.id)
+    items = w.get(uid, [])
+    if not items:
+        await interaction.response.send_message(f"{member.mention} has no warnings.", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"⚠️ Warnings for {member}", color=discord.Color.orange())
+    for i, rec in enumerate(items[-10:], start=1):
+        embed.add_field(name=f"#{i}", value=f"{rec['reason']} — {rec['moderator']}\n{rec['time']}", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="clearwarns", description="Clear all warnings for a user")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def slash_clearwarns(interaction: discord.Interaction, member: discord.Member):
+    w = load_warnings()
+    uid = str(member.id)
+    if uid in w:
+        del w[uid]
+        save_warnings(w)
+        await interaction.response.send_message(f"✅ Cleared warnings for {member.mention}", ephemeral=True)
+        log_action(interaction.guild, f"🧹 Cleared warnings for {member} by {interaction.user}")
+    else:
+        await interaction.response.send_message("That user has no warnings.", ephemeral=True)
+
+# Infractions
+@bot.tree.command(name="infractions", description="View all warnings and timeouts for a user")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def slash_infractions(interaction: discord.Interaction, member: discord.Member):
+    w = load_warnings(); t = load_timeouts()
+    uid = str(member.id)
+    warns = w.get(uid, []); topts = t.get(uid, [])
+    total = len(warns) + len(topts)
+    if total == 0:
+        await interaction.response.send_message(f"{member.mention} has a clean record!", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"📜 Infractions for {member}", color=discord.Color.red() if total>3 else discord.Color.orange())
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Total Warnings", value=str(total_warns), inline=True)
-    embed.add_field(name="Total Timeouts", value=str(total_timeouts), inline=True)
+    embed.add_field(name="Warnings", value=str(len(warns)), inline=True)
+    embed.add_field(name="Timeouts", value=str(len(topts)), inline=True)
     if warns:
         text = ""
-        for i, w in enumerate(warns[-5:], start=1):
-            text += f"**#{i}** {w['reason']} (by {w['moderator']}) — {w['time']}\n"
+        for i, rec in enumerate(warns[-5:], start=1):
+            text += f"#{i} {rec['reason']} — {rec['moderator']} ({rec['time']})\n"
         embed.add_field(name="Recent Warnings", value=text[:1024], inline=False)
-    if touts:
+    if topts:
         text = ""
-        for i, t in enumerate(touts[-5:], start=1):
-            text += f"**#{i}** {t['reason']} — {t['duration']} (by {t['moderator']}) — {t['timestamp']}\n"
+        for i, rec in enumerate(topts[-5:], start=1):
+            text += f"#{i} {rec['duration']} {rec['reason']} — {rec['moderator']} ({rec['timestamp']})\n"
         embed.add_field(name="Recent Timeouts", value=text[:1024], inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ----------------------------------------
-# Help command (slash) with buttons
-# ----------------------------------------
+# Tickets & reaction panels (admin)
+@bot.tree.command(name="ticket_panel", description="Create a ticket panel (button) in the current channel")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticket_panel(interaction: discord.Interaction):
+    view = TicketCreateView()
+    await interaction.response.send_message("🎫 Click to create a ticket.", view=view)
+    log_action(interaction.guild, f"Ticket panel created by {interaction.user}")
+
+@bot.tree.command(name="ticket_category", description="Set ticket category channel")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticket_category(interaction: discord.Interaction, category: discord.CategoryChannel):
+    gcfg = guild_config(interaction.guild.id)
+    gcfg["ticket_category"] = str(category.id)
+    save_json(CONFIG_FILE, config)
+    await interaction.response.send_message(f"✅ Ticket category set to {category.name}", ephemeral=True)
+
+@bot.tree.command(name="reaction_panel", description="Create a reaction/ button role panel")
+@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.describe(panel_type="button or reaction")
+async def reaction_panel(interaction: discord.Interaction, panel_type: str = "button", *, text: str = "React to get roles"):
+    embed = discord.Embed(title="Reaction Roles", description=text, color=discord.Color.blurple())
+    msg = await interaction.channel.send(embed=embed)
+    reaction_panels[str(msg.id)] = {"guild": str(interaction.guild.id), "type": panel_type, "roles": {}}
+    save_reaction_panels()
+    if panel_type == "button":
+        try:
+            await msg.edit(view=ReactionRoleView(msg.id))
+        except:
+            pass
+    await interaction.response.send_message(f"✅ Panel created (ID: {msg.id})", ephemeral=True)
+
+@bot.tree.command(name="add_reaction_role", description="Link an emoji to a role for a panel")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def add_reaction_role(interaction: discord.Interaction, message_id: str, emoji: str, role: discord.Role):
+    panel = reaction_panels.get(str(message_id))
+    if not panel:
+        await interaction.response.send_message("Panel not found.", ephemeral=True); return
+    panel["roles"][emoji] = str(role.id)
+    save_reaction_panels()
+    if panel.get("type") == "reaction":
+        try:
+            # attempt to find message
+            for ch in interaction.guild.text_channels:
+                try:
+                    m = await ch.fetch_message(int(message_id))
+                    await m.add_reaction(emoji)
+                    break
+                except:
+                    continue
+        except:
+            pass
+    else:
+        try:
+            for ch in interaction.guild.text_channels:
+                try:
+                    m = await ch.fetch_message(int(message_id))
+                    await m.edit(view=ReactionRoleView(message_id))
+                    break
+                except:
+                    continue
+        except:
+            pass
+    await interaction.response.send_message(f"✅ Added {emoji} -> {role.name} to panel {message_id}", ephemeral=True)
+
+# Premium toggle + example
+@bot.tree.command(name="premium", description="Toggle premium utilities for server (admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def premium_toggle(interaction: discord.Interaction, enable: bool):
+    gcfg = guild_config(interaction.guild.id)
+    gcfg["premium"] = bool(enable)
+    save_json(CONFIG_FILE, config)
+    await interaction.response.send_message(f"Premium utilities {'enabled' if enable else 'disabled'} for this server.", ephemeral=True)
+
+@bot.tree.command(name="premium_info", description="(Premium) Show upgraded utilities - example")
+async def premium_info(interaction: discord.Interaction):
+    gcfg = guild_config(interaction.guild.id)
+    if not gcfg.get("premium"):
+        await interaction.response.send_message("This server does not have premium utilities enabled. Ask an admin to run `/premium true`", ephemeral=True)
+        return
+    await interaction.response.send_message("✨ Premium utilities active: advanced logs, priority ticket handling, extra automod rules.", ephemeral=True)
+
+# ---------------------------
+# Help view (button-based)
+# ---------------------------
 class HelpView(View):
     def __init__(self):
         super().__init__(timeout=120)
-
-    async def update_embed(self, interaction: discord.Interaction, title: str, desc: str, color):
+    async def update_embed(self, interaction: discord.Interaction, title, desc, color):
         embed = discord.Embed(title=title, description=desc, color=color)
-        embed.set_footer(text="Use buttons to switch sections • Expires in 2 minutes")
+        embed.set_footer(text="Use the buttons • Expires in 2 minutes")
         await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="Moderation ⚔️", style=discord.ButtonStyle.blurple)
@@ -915,70 +745,136 @@ class HelpView(View):
             "• `/kick`, `/ban`, `/unban`\n"
             "• `/warn`, `/warnings`, `/clearwarns`\n"
             "• `/timeout`, `/untimeout`, `/timeouts`\n"
-            "• `/infractions` — Show combined record\n"
-            "• Auto-warn after 3 timeouts\n"
-            "• Auto-ban after 5 warnings"
+            "• `/infractions` — full punishment summary\n"
+            "• Auto-warn after 3 timeouts; Auto-ban after 5 warnings"
         )
-        await self.update_embed(interaction, "⚔️ Moderation Commands", desc, discord.Color.red())
+        await self.update_embed(interaction, "⚔️ Moderation", desc, discord.Color.red())
 
-    @discord.ui.button(label="Utility 🧰", style=discord.ButtonStyle.green)
-    async def util_btn(self, interaction: discord.Interaction, button: Button):
+    @discord.ui.button(label="Tickets & Roles 🎫", style=discord.ButtonStyle.green)
+    async def ticket_btn(self, interaction: discord.Interaction, button: Button):
         desc = (
-            "• `/xp` — Show XP & level\n"
-            "• `/serverinfo` — Server info\n"
-            "• `/userinfo` — User info\n"
-            "• Ticket & reaction role support (see below)"
+            "• `/ticket_panel` — Create ticket creation button\n"
+            "• `/ticket_category` — Set a category for tickets\n"
+            "• `/reaction_panel` — Create reaction/button role panel\n"
+            "• `/add_reaction_role` — Link emoji -> role for a panel"
         )
-        await self.update_embed(interaction, "🧰 Utility Commands", desc, discord.Color.green())
+        await self.update_embed(interaction, "🎫 Tickets & Roles", desc, discord.Color.green())
 
-    @discord.ui.button(label="Setup & Premium ⚙️", style=discord.ButtonStyle.gray)
-    async def setup_btn(self, interaction: discord.Interaction, button: Button):
+    @discord.ui.button(label="XP & Premium ✨", style=discord.ButtonStyle.gray)
+    async def xp_btn(self, interaction: discord.Interaction, button: Button):
         desc = (
-            "• `/setwelcome`, `/setgoodbye`, `/setlog` — Configure channels\n"
-            "• `/setstaffrole`, `/setticketcategory` — Ticket settings\n"
-            "• `/setlevelreward` — reward role for reaching a level\n"
-            "• `/setpremium` — enable premium features for this server"
+            "• Active XP system: chat messages grant XP and levels\n"
+            "• Admins can configure role rewards in config.json\n"
+            "• `/premium true` to enable premium utilities"
         )
-        await self.update_embed(interaction, "⚙️ Setup & Premium", desc, discord.Color.blurple())
+        await self.update_embed(interaction, "✨ XP & Premium", desc, discord.Color.blurple())
 
     @discord.ui.button(label="Close ❌", style=discord.ButtonStyle.red)
     async def close_btn(self, interaction: discord.Interaction, button: Button):
-        try:
-            await interaction.message.delete()
-        except:
-            pass
+        await interaction.message.delete()
 
-@bot.tree.command(name="help", description="Show help and command categories")
+@bot.tree.command(name="help", description="Show the help menu")
 async def help_slash(interaction: discord.Interaction):
-    embed = discord.Embed(title="🛠️ Bot Help", description="Click buttons to browse categories.", color=discord.Color.blurple())
+    embed = discord.Embed(title="🛠️ Bot Help", description="Press buttons to view categories.", color=discord.Color.blurple())
     view = HelpView()
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-# ----------------------------------------
-# Additional utility slash commands (serverinfo, userinfo)
-# ----------------------------------------
-@bot.tree.command(name="serverinfo", description="Show information about this server")
-async def serverinfo(interaction: discord.Interaction):
-    g = interaction.guild
-    embed = discord.Embed(title=f"📊 {g.name}", color=discord.Color.blurple())
-    embed.add_field(name="Owner", value=str(g.owner), inline=True)
-    embed.add_field(name="Members", value=str(g.member_count), inline=True)
-    embed.add_field(name="Created", value=g.created_at.strftime("%Y-%m-%d"), inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+# ---------------------------
+# Rotating status (auto)
+# ---------------------------
+async def cycle_status():
+    statuses = [
+        ("watching", "over the server 👀"),
+        ("listening", "to your commands 🎧"),
+        ("playing", "with moderation tools 🛠️"),
+        ("competing", "for best bot award 🏆"),
+        ("watching", "for rule breakers ⚔️"),
+        ("listening", "to feedback 💬")
+    ]
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        status_type, status_text = random.choice(statuses)
+        try:
+            if status_type.lower() == "playing":
+                activity = discord.Game(name=status_text)
+            elif status_type.lower() == "listening":
+                activity = discord.Activity(type=discord.ActivityType.listening, name=status_text)
+            elif status_type.lower() == "watching":
+                activity = discord.Activity(type=discord.ActivityType.watching, name=status_text)
+            elif status_type.lower() == "competing":
+                activity = discord.Activity(type=discord.ActivityType.competing, name=status_text)
+            else:
+                activity = discord.Game(name=status_text)
+            await bot.change_presence(status=discord.Status.online, activity=activity)
+        except Exception:
+            print("Failed to change presence:", traceback.format_exc())
+        await asyncio.sleep(60)  # rotate every 60 seconds
 
-@bot.tree.command(name="userinfo", description="Show user information")
-@app_commands.describe(member="User to show info for")
-async def userinfo(interaction: discord.Interaction, member: discord.Member = None):
-    member = member or interaction.user
-    embed = discord.Embed(title=f"👤 {member}", color=discord.Color.green())
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="ID", value=str(member.id), inline=True)
-    embed.add_field(name="Joined", value=str(member.joined_at) if member.joined_at else "Unknown", inline=True)
-    embed.add_field(name="Created", value=str(member.created_at), inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+# ---------------------------
+# Startup helpers
+# ---------------------------
+async def rebuild_views_on_startup():
+    await bot.wait_until_ready()
+    # Reattach views for reaction-role button panels (best-effort)
+    for mid, panel in list(reaction_panels.items()):
+        try:
+            gid = int(panel["guild"])
+            g = bot.get_guild(gid)
+            if not g: continue
+            for ch in g.text_channels:
+                try:
+                    m = await ch.fetch_message(int(mid))
+                    if panel.get("type") == "button":
+                        await m.edit(view=ReactionRoleView(mid))
+                    break
+                except:
+                    continue
+        except:
+            continue
 
-# ----------------------------------------
-# Start the bot
-# ----------------------------------------
+# ---------------------------
+# Events: welcome/goodbye & ready
+# ---------------------------
+@bot.event
+async def on_member_join(member: discord.Member):
+    gcfg = guild_config(member.guild.id)
+    if gcfg.get("welcome_channel"):
+        ch = member.guild.get_channel(int(gcfg["welcome_channel"]))
+        if ch:
+            await ch.send(f"🎉 Welcome {member.mention} to **{member.guild.name}**!")
+    try:
+        dm_template = gcfg.get("welcome_dm", "👋 Welcome {user} to {server}!")
+        message = dm_template.replace("{user}", member.name).replace("{server}", member.guild.name)
+        await member.send(message)
+    except:
+        pass
+    log_action(member.guild, f"✅ Member joined: {member}")
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    gcfg = guild_config(member.guild.id)
+    if gcfg.get("goodbye_channel"):
+        ch = member.guild.get_channel(int(gcfg["goodbye_channel"]))
+        if ch:
+            await ch.send(f"👋 {member.name} has left the server.")
+    log_action(member.guild, f"❌ Member left: {member}")
+
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    try:
+        await bot.tree.sync()
+    except Exception:
+        pass
+    # start background tasks
+    bot.loop.create_task(cycle_status())
+    bot.loop.create_task(rebuild_views_on_startup())
+    load_xp()
+    print("Background tasks started.")
+
+# ---------------------------
+# Run the bot
+# ---------------------------
 if __name__ == "__main__":
+    load_xp()
     bot.run(TOKEN)

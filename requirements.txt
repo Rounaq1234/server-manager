@@ -3,3 +3,4 @@ aiofiles
 asyncio
 Flask
 python-dotenv
+aiohttp
