@@ -2,5 +2,14 @@
   "welcome_channel": null,
   "goodbye_channel": null,
   "log_channel": null,
-  "welcome_dm_message": "👋 Welcome {user} to {server}! Glad to have you here!"
+  "filters": {
+    "anti_link": true,
+    "anti_spam": true,
+    "caps_filter": true
+  },
+  "level_rewards": {
+    "5": null,
+    "10": null
+  },
+  "premium_guilds": []
 }
